@@ -19,7 +19,7 @@ import math
 import os
 import warnings
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import torch
 import torch.utils.checkpoint
@@ -56,6 +56,14 @@ logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "openai-community/gpt2"
 _CONFIG_FOR_DOC = "GPT2Config"
+
+ALL_CACHE_NAMES = [
+    "past_key_values",  # default
+    "cache_params",  # mamba-based models
+    "state",  # rwkv
+    "mems",  # xlnet
+    "past_buckets_states",  # reformer
+]
 
 
 def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
@@ -1286,6 +1294,71 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
             tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past)
             for layer_past in past_key_values
         )
+
+    def _update_model_kwargs_for_generation(
+        self,
+        outputs: ModelOutput,
+        model_kwargs: Dict[str, Any],
+        input_ids: torch.Tensor = torch.tensor([[]]),
+        is_encoder_decoder: bool = False,
+        num_new_tokens: int = 1,
+    ) -> Dict[str, Any]:
+        # input_ids contains all tokens aside from the one last generated
+
+        # update past_key_values keeping its naming used in model code
+        for possible_cache_name in ALL_CACHE_NAMES:
+            if possible_cache_name in outputs:
+                # TODO (joao): remove output/input mismatch when these old models (xlnet, reformer) are deprecated
+                if possible_cache_name in ("past_buckets_states", "mems"):
+                    cache_name = "past_key_values"
+                else:
+                    cache_name = possible_cache_name
+                model_kwargs[cache_name] = getattr(outputs, possible_cache_name)
+                break
+
+        # update token_type_ids with last value or new token if generated from eos_token
+        if "token_type_ids" in model_kwargs:
+            # UPDATE Swap token type id if the last generated token was an <eot> token
+            token_type_ids = model_kwargs["token_type_ids"]
+            new_token_type_id = token_type_ids[:, -1]
+            if input_ids.size(1) > 0:
+                has_eos = input_ids[:, -1] == self.config.eos_token_id
+                new_token_type_id = torch.where(has_eos, 3-new_token_type_id, new_token_type_id)
+
+            model_kwargs["token_type_ids"] = torch.cat([token_type_ids, new_token_type_id.unsqueeze(-1)], dim=-1)
+
+        # UPDATE Increment position_ids if using past_key_values since they are not being properly handled
+        # https://github.com/huggingface/transformers/issues/36510
+        if "position_ids" in model_kwargs:
+            position_ids = model_kwargs["position_ids"]
+            model_kwargs["position_ids"] = torch.cat([position_ids, position_ids[:, -1].unsqueeze(-1)+1], dim=-1)
+
+        if not is_encoder_decoder:
+            # update attention mask
+            if "attention_mask" in model_kwargs:
+                attention_mask = model_kwargs["attention_mask"]
+                model_kwargs["attention_mask"] = torch.cat(
+                    [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
+                )
+        else:
+            # update decoder attention mask
+            if "decoder_attention_mask" in model_kwargs:
+                decoder_attention_mask = model_kwargs["decoder_attention_mask"]
+                model_kwargs["decoder_attention_mask"] = torch.cat(
+                    [decoder_attention_mask, decoder_attention_mask.new_ones((decoder_attention_mask.shape[0], 1))],
+                    dim=-1,
+                )
+
+        if model_kwargs.get("use_cache", True):
+            model_kwargs["cache_position"] = model_kwargs["cache_position"][-1:] + num_new_tokens
+        else:
+            past_positions = model_kwargs.pop("cache_position")
+            new_positions = torch.arange(
+                past_positions[-1] + 1, past_positions[-1] + num_new_tokens + 1, dtype=past_positions.dtype
+            ).to(past_positions.device)
+            model_kwargs["cache_position"] = torch.cat((past_positions, new_positions))
+        return model_kwargs
+
 
     def prepare_inputs_for_generation(
         self,

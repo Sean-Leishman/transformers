@@ -2660,6 +2660,7 @@ class GenerationMixin:
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs,
                 model_kwargs,
+                input_ids=input_ids,
                 is_encoder_decoder=self.config.is_encoder_decoder,
             )
             if synced_gpus and this_peer_finished:
@@ -3244,6 +3245,7 @@ class GenerationMixin:
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs,
                 model_kwargs,
+                input_ids=input_ids,
                 is_encoder_decoder=self.config.is_encoder_decoder,
             )
             if synced_gpus and this_peer_finished:
@@ -3493,6 +3495,7 @@ class GenerationMixin:
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs,
                 model_kwargs,
+                input_ids=input_ids,
                 is_encoder_decoder=self.config.is_encoder_decoder,
             )
             if synced_gpus and this_peer_finished:
@@ -3749,6 +3752,7 @@ class GenerationMixin:
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs,
                 model_kwargs,
+                input_ids=input_ids,
                 is_encoder_decoder=self.config.is_encoder_decoder,
             )
             if synced_gpus and this_peer_finished:
@@ -4029,6 +4033,7 @@ class GenerationMixin:
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs,
                 model_kwargs,
+                input_ids=input_ids,
                 is_encoder_decoder=self.config.is_encoder_decoder,
             )
             if synced_gpus and this_peer_finished:
@@ -4347,6 +4352,7 @@ class GenerationMixin:
                 outputs,
                 model_kwargs,
                 is_encoder_decoder=self.config.is_encoder_decoder,
+                input_ids=input_ids,
                 num_new_tokens=n_matches + 1,
             )
             if synced_gpus and this_peer_finished:
