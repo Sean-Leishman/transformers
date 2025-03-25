@@ -17,7 +17,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.utils.checkpoint
@@ -41,6 +41,7 @@ from ...processing_utils import Unpack
 from ...pytorch_utils import ALL_LAYERNORM_LAYERS
 from ...utils import (
     LossKwargs,
+    ModelOutput,
     add_code_sample_docstrings,
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
@@ -62,6 +63,14 @@ logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "meta-llama/Llama-2-7b-hf"
 _CONFIG_FOR_DOC = "LlamaConfig"
+
+ALL_CACHE_NAMES = [
+    "past_key_values",  # default
+    "cache_params",  # mamba-based models
+    "state",  # rwkv
+    "mems",  # xlnet
+    "past_buckets_states",  # reformer
+]
 
 
 class LlamaRMSNorm(nn.Module):
@@ -194,7 +203,26 @@ class LlamaMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        gate_out = self.gate_proj(x)
+        act_out = self.act_fn(gate_out)
+        up_out = self.up_proj(x)
+
+        # Free intermediate tensors if possible
+        del gate_out
+
+        # Compute the multiplication
+        intermediate = act_out * up_out
+
+        # Free more intermediates
+        del act_out
+        del up_out
+
+        # Final projection
+        down_proj = self.down_proj(intermediate)
+
+        # Free the last intermediate
+        del intermediate
+
         return down_proj
 
 
@@ -239,7 +267,7 @@ def eager_attention_forward(
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: LlamaConfig, layer_idx: int):
+    def __init__(self, config: LlamaConfig, layer_idx: int, is_cross_attention: bool = False):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -261,6 +289,9 @@ class LlamaAttention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
+
+        if is_cross_attention:
+            raise ValueError("Cross-attention is not supported in LLaMA models.")
 
     def forward(
         self,
@@ -323,12 +354,17 @@ class LlamaDecoderLayer(nn.Module):
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        if config.add_cross_attention:
+            raise ValueError("Cross-attention is not supported in LLaMA models.")
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
+        # encoder_hidden_states: Optional[torch.Tensor] = None,
+        # encoder_attention_mask: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
@@ -352,6 +388,25 @@ class LlamaDecoderLayer(nn.Module):
             **kwargs,
         )
         hidden_states = residual + hidden_states
+
+        encoder_hidden_states = kwargs.get("encoder_hidden_states", None)
+        encoder_attention_mask = kwargs.get("encoder_attention_mask", None)
+        if encoder_hidden_states is not None:
+            if not hasattr(self, "cross_attn"):
+                raise ValueError("This model does not have a cross-attention layer.")
+
+            residual = hidden_states
+            hidden_states = self.cross_attn_layernorm(hidden_states)
+            cross_attn_outputs, cross_attn_weights = self.cross_attn(
+                hidden_states=hidden_states,
+                attention_mask=encoder_attention_mask,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                output_attentions=output_attentions,
+            )
+
+            attn_output = cross_attn_outputs[0]
+            hidden_states = residual + attn_output
 
         # Fully Connected
         residual = hidden_states
@@ -775,6 +830,10 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
+    @property
+    def transformer(self):
+        return self.model
+
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
@@ -884,6 +943,70 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    def _update_model_kwargs_for_generation(
+        self,
+        outputs: ModelOutput,
+        model_kwargs: Dict[str, Any],
+        input_ids: torch.Tensor = torch.tensor([[]]),
+        is_encoder_decoder: bool = False,
+        num_new_tokens: int = 1,
+    ) -> Dict[str, Any]:
+        # input_ids contains all tokens aside from the one last generated
+
+        # update past_key_values keeping its naming used in model code
+        for possible_cache_name in ALL_CACHE_NAMES:
+            if possible_cache_name in outputs:
+                # TODO (joao): remove output/input mismatch when these old models (xlnet, reformer) are deprecated
+                if possible_cache_name in ("past_buckets_states", "mems"):
+                    cache_name = "past_key_values"
+                else:
+                    cache_name = possible_cache_name
+                model_kwargs[cache_name] = getattr(outputs, possible_cache_name)
+                break
+
+        # update token_type_ids with last value or new token if generated from eos_token
+        if "token_type_ids" in model_kwargs:
+            # UPDATE Swap token type id if the last generated token was an <eot> token
+            token_type_ids = model_kwargs["token_type_ids"]
+            new_token_type_id = token_type_ids[:, -1]
+            if input_ids.size(1) > 0:
+                has_eos = input_ids[:, -1] == self.config.eos_token_id
+                new_token_type_id = torch.where(has_eos, 3 - new_token_type_id, new_token_type_id)
+
+            model_kwargs["token_type_ids"] = torch.cat([token_type_ids, new_token_type_id.unsqueeze(-1)], dim=-1)
+
+        # UPDATE Increment position_ids if using past_key_values since they are not being properly handled
+        # https://github.com/huggingface/transformers/issues/36510
+        if "position_ids" in model_kwargs:
+            position_ids = model_kwargs["position_ids"]
+            model_kwargs["position_ids"] = torch.cat([position_ids, position_ids[:, -1].unsqueeze(-1) + 1], dim=-1)
+
+        if not is_encoder_decoder:
+            # update attention mask
+            if "attention_mask" in model_kwargs:
+                attention_mask = model_kwargs["attention_mask"]
+                model_kwargs["attention_mask"] = torch.cat(
+                    [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
+                )
+        else:
+            # update decoder attention mask
+            if "decoder_attention_mask" in model_kwargs:
+                decoder_attention_mask = model_kwargs["decoder_attention_mask"]
+                model_kwargs["decoder_attention_mask"] = torch.cat(
+                    [decoder_attention_mask, decoder_attention_mask.new_ones((decoder_attention_mask.shape[0], 1))],
+                    dim=-1,
+                )
+
+        if model_kwargs.get("use_cache", True):
+            model_kwargs["cache_position"] = model_kwargs["cache_position"][-1:] + num_new_tokens
+        else:
+            past_positions = model_kwargs.pop("cache_position")
+            new_positions = torch.arange(
+                past_positions[-1] + 1, past_positions[-1] + num_new_tokens + 1, dtype=past_positions.dtype
+            ).to(past_positions.device)
+            model_kwargs["cache_position"] = torch.cat((past_positions, new_positions))
+        return model_kwargs
 
 
 @add_start_docstrings(

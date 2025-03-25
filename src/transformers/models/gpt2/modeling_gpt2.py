@@ -1323,7 +1323,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
             new_token_type_id = token_type_ids[:, -1]
             if input_ids.size(1) > 0:
                 has_eos = input_ids[:, -1] == self.config.eos_token_id
-                new_token_type_id = torch.where(has_eos, 3-new_token_type_id, new_token_type_id)
+                new_token_type_id = torch.where(has_eos, 3 - new_token_type_id, new_token_type_id)
 
             model_kwargs["token_type_ids"] = torch.cat([token_type_ids, new_token_type_id.unsqueeze(-1)], dim=-1)
 
@@ -1331,7 +1331,13 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
         # https://github.com/huggingface/transformers/issues/36510
         if "position_ids" in model_kwargs:
             position_ids = model_kwargs["position_ids"]
-            model_kwargs["position_ids"] = torch.cat([position_ids, position_ids[:, -1].unsqueeze(-1)+1], dim=-1)
+            model_kwargs["position_ids"] = torch.cat([position_ids, position_ids[:, -1].unsqueeze(-1) + 1], dim=-1)
+            if model_kwargs["position_ids"].max() >= self.config.max_position_embeddings:
+                if model_kwargs["position_ids"].max() > self.config.max_position_embeddings:
+                    raise ValueError("position_ids are out of range")
+
+                cond = model_kwargs["position_ids"] >= self.config.max_position_embeddings
+                model_kwargs["position_ids"][cond] = self.config.max_position_embeddings - 1
 
         if not is_encoder_decoder:
             # update attention mask
@@ -1358,7 +1364,6 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
             ).to(past_positions.device)
             model_kwargs["cache_position"] = torch.cat((past_positions, new_positions))
         return model_kwargs
-
 
     def prepare_inputs_for_generation(
         self,

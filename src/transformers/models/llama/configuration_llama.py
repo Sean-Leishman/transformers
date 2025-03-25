@@ -181,6 +181,7 @@ class LlamaConfig(PretrainedConfig):
         attention_dropout=0.0,
         mlp_bias=False,
         head_dim=None,
+        add_cross_attention=False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -211,6 +212,8 @@ class LlamaConfig(PretrainedConfig):
         if self.rope_scaling is not None and "type" in self.rope_scaling:
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
         rope_config_validation(self)
+
+        self.add_cross_attention = add_cross_attention
 
         super().__init__(
             pad_token_id=pad_token_id,
